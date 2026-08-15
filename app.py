@@ -1,4 +1,3 @@
-```python
 import io
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -1974,4 +1973,3 @@ st.divider()
 st.caption(
     "Escala Amazon • Sistema independente de gestão de escala"
 )
-```
