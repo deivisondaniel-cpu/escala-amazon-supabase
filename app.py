@@ -1,38 +1,28 @@
 import io
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, unquote
 
 import pandas as pd
 import psycopg2
-from psycopg2.extras import RealDictCursor
 import streamlit as st
 
-
 # ============================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÃO DA PÁGINA
 # ============================================================
 st.set_page_config(
     page_title="Monitoramento Amazon",
     page_icon="🕒",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="collapsed"
 )
 
+# ============================================================
+# BANCO DE DADOS — SUPABASE / POSTGRESQL
+# ============================================================
 DB_URL = st.secrets["connections"]["supabase_db"]["url"]
 
-
-# ============================================================
-# CONEXÃO COM SUPABASE / POSTGRESQL
-# ============================================================
 def conectar():
-    """
-    Abre uma conexão com o PostgreSQL do Supabase.
-
-    A URL é desmontada manualmente porque senhas de banco podem
-    conter caracteres codificados, como %40 para @. Isso evita o
-    erro do psycopg2 do tipo "missing = after ...".
-    """
-    from urllib.parse import urlparse, unquote
-
+    """Abre uma conexão persistente com o PostgreSQL do Supabase."""
     url = urlparse(str(DB_URL).strip())
 
     if url.scheme not in ("postgresql", "postgres"):
@@ -56,156 +46,147 @@ def conectar():
     conn = psycopg2.connect(
         host=host,
         port=port,
-        database=database,
+        dbname=database,
         user=user,
         password=password,
-        connect_timeout=10,
+        connect_timeout=15,
         sslmode="require",
-        client_encoding="UTF8",
     )
-
-    # Garante UTF-8 mesmo quando o pooler não informa o encoding
-    # automaticamente durante o handshake.
     conn.set_client_encoding("UTF8")
-
     return conn
 
-
-def executar(query, params=None, fetch=False, fetchone=False):
+def criar_banco_do_zero():
     """
-    Executa uma operação no banco com commit/rollback seguro.
-    Cada alteração fica persistida no Supabase, não em arquivo local.
+    Cria as tabelas somente se elas ainda não existirem.
+    Se já existirem, NÃO apaga nem recria dados.
     """
-    conn = None
-    try:
-        conn = conectar()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(query, params or ())
-            resultado = None
-            if fetchone:
-                resultado = cur.fetchone()
-            elif fetch:
-                resultado = cur.fetchall()
-        conn.commit()
-        return resultado
-    except Exception:
-        if conn:
-            conn.rollback()
-        raise
-    finally:
-        if conn:
-            conn.close()
+    conn = conectar()
+    cursor = conn.cursor()
 
-
-# ============================================================
-# BANCO - CRIAÇÃO AUTOMÁTICA DAS TABELAS
-# ============================================================
-def criar_banco():
-    executar("""
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS operadores (
             id BIGSERIAL PRIMARY KEY,
             nome TEXT NOT NULL,
             funcao TEXT NOT NULL,
-            turno TEXT NOT NULL CHECK (turno IN ('T1', 'T2', 'T3')),
-            ativo BOOLEAN NOT NULL DEFAULT TRUE,
-            criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
+            turno TEXT NOT NULL,
+            ativo BOOLEAN NOT NULL DEFAULT TRUE
+        )
     """)
 
-    executar("""
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS escala (
             id BIGSERIAL PRIMARY KEY,
-            operador_id BIGINT NOT NULL REFERENCES operadores(id),
-            semana_id DATE NOT NULL,
+            operador_id BIGINT NOT NULL,
+            semana_id TEXT NOT NULL,
             sexta TEXT NOT NULL,
             sabado TEXT NOT NULL,
             domingo TEXT NOT NULL,
-            segunda TEXT NOT NULL,
-            criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            CONSTRAINT uq_escala_operador_semana
-                UNIQUE (operador_id, semana_id)
-        );
+            segunda TEXT NOT NULL
+        )
     """)
 
-    executar("""
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS historico (
             id BIGSERIAL PRIMARY KEY,
-            data_hora TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            operador_id BIGINT,
+            data_hora TEXT NOT NULL,
             operador_nome TEXT NOT NULL,
-            semana_id DATE NOT NULL,
+            semana_id TEXT NOT NULL,
             dia TEXT NOT NULL,
             de_status TEXT NOT NULL,
             para_status TEXT NOT NULL
-        );
+        )
     """)
 
-    executar("""
-        CREATE INDEX IF NOT EXISTS idx_escala_semana
-        ON escala (semana_id);
-    """)
+    conn.commit()
 
-    executar("""
-        CREATE INDEX IF NOT EXISTS idx_historico_semana
-        ON historico (semana_id);
+    # Compatibilidade com a tabela já existente no Supabase:
+    # ativo pode ter sido criado como INTEGER (0/1).
+    cursor.execute("""
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'operadores'
+          AND column_name = 'ativo'
     """)
+    tipo_ativo = cursor.fetchone()
 
+    if tipo_ativo and tipo_ativo[0] in ("integer", "bigint", "smallint"):
+        cursor.execute("""
+            ALTER TABLE public.operadores
+            ALTER COLUMN ativo DROP DEFAULT
+        """)
+        cursor.execute("""
+            ALTER TABLE public.operadores
+            ALTER COLUMN ativo TYPE BOOLEAN
+            USING (ativo <> 0)
+        """)
+        cursor.execute("""
+            ALTER TABLE public.operadores
+            ALTER COLUMN ativo SET DEFAULT TRUE
+        """)
+        conn.commit()
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM operadores WHERE ativo IS TRUE"
+    )
+    dados_existentes = cursor.fetchone()[0]
+
+    if dados_existentes == 0:
+        funcionarios_oficiais = [
+            ("ALAN ARAÚJO", "ANALISTA", "T1"),
+            ("MARGARIDA", "PICKUP", "T1"),
+            ("JOSÉ BRUNO PALHANO", "PICKUP", "T1"),
+            ("CRISTOVÃO MIKELLYS", "DEPART", "T1"),
+            ("PEDRO LUCAS", "DROPOFF", "T1"),
+            ("FELIPE ALLAN", "DROPOFF", "T1"),
+            ("BRUNA BLENDA", "DROPOFF", "T1"),
+            ("CONCEIÇÃO DAIANE", "SEGURANÇA (ONISYS)", "T1"),
+            ("MATHEUS LUSTOSA", "SEGURANÇA/ELOG", "T1"),
+            ("MANUELA PINHEIRO", "LÍDER", "T2"),
+            ("ISABEL", "LÍDER/SEGURANÇA", "T2"),
+            ("ANDREZA OLIVEIRA", "PICKUP", "T2"),
+            ("ROZIANE DA SILVA", "PICKUP", "T2"),
+            ("DAIANE", "SEGURANÇA", "T2"),
+            ("EMANUEL ROBERTO", "DEPART", "T2"),
+            ("TAMMYRIS DA SILVA", "DROPOFF", "T2"),
+            ("RAPHAEL DO NASCIMENTO", "DROPOFF", "T2"),
+            ("LUDMILLA RODRIGUES", "DROPOFF", "T2"),
+            ("MARIA NATHALIA", "SEGURANÇA", "T2"),
+            ("CINAMOR", "ELOG", "T2"),
+            ("WESLEY", "LÍDER", "T3"),
+            ("JOÃO", "LÍDER/SEGURANÇA", "T3"),
+            ("RILDOMAR", "PICKUP", "T3"),
+            ("LUCIANA", "PICKUP", "T3"),
+            ("GLAYLDSON", "SEGURANÇA", "T3"),
+            ("TAYANARA", "DEPART", "T3"),
+            ("RUAN", "DROPOFF", "T3"),
+            ("BÁRBARA", "DROPOFF", "T3")
+        ]
+
+        cursor.executemany("""
+            INSERT INTO operadores (nome, funcao, turno)
+            VALUES (%s, %s, %s)
+        """, funcionarios_oficiais)
+        conn.commit()
+
+    conn.close()
+
+# Inicializa/valida as estruturas sem usar SQLite.
+criar_banco_do_zero()
 
 # ============================================================
-# DADOS PADRÃO
+# CONSTANTES
 # ============================================================
-FUNCIONARIOS_OFICIAIS = [
-    ("ALAN ARAÚJO", "ANALISTA", "T1"),
-    ("MARGARIDA", "PICKUP", "T1"),
-    ("JOSÉ BRUNO PALHANO", "PICKUP", "T1"),
-    ("CRISTOVÃO MIKELLYS", "DEPART", "T1"),
-    ("PEDRO LUCAS", "DROPOFF", "T1"),
-    ("FELIPE ALLAN", "DROPOFF", "T1"),
-    ("BRUNA BLENDA", "DROPOFF", "T1"),
-    ("CONCEIÇÃO DAIANE", "SEGURANÇA (ONISYS)", "T1"),
-    ("MATHEUS LUSTOSA", "SEGURANÇA/ELOG", "T1"),
-    ("MANUELA PINHEIRO", "LÍDER", "T2"),
-    ("ISABEL", "LÍDER/SEGURANÇA", "T2"),
-    ("ANDREZA OLIVEIRA", "PICKUP", "T2"),
-    ("ROZIANE DA SILVA", "PICKUP", "T2"),
-    ("DAIANE", "SEGURANÇA", "T2"),
-    ("EMANUEL ROBERTO", "DEPART", "T2"),
-    ("TAMMYRIS DA SILVA", "DROPOFF", "T2"),
-    ("RAPHAEL DO NASCIMENTO", "DROPOFF", "T2"),
-    ("LUDMILLA RODRIGUES", "DROPOFF", "T2"),
-    ("MARIA NATHALIA", "SEGURANÇA", "T2"),
-    ("CINAMOR", "ELOG", "T2"),
-    ("WESLEY", "LÍDER", "T3"),
-    ("JOÃO", "LÍDER/SEGURANÇA", "T3"),
-    ("RILDOMAR", "PICKUP", "T3"),
-    ("LUCIANA", "PICKUP", "T3"),
-    ("GLAYLDSON", "SEGURANÇA", "T3"),
-    ("TAYANARA", "DEPART", "T3"),
-    ("RUAN", "DROPOFF", "T3"),
-    ("BÁRBARA", "DROPOFF", "T3"),
-]
-
 HORARIOS = {
     "T1": "07:00 às 15:00",
     "T2": "15:00 às 23:00",
-    "T3": "23:00 às 07:00",
+    "T3": "23:00 às 07:00"
 }
+NOMES_TURNOS = {"T1": "Turno 1", "T2": "Turno 2", "T3": "Turno 3"}
+DIAS = [("Sexta", "sexta"), ("Sábado", "sabado"), ("Domingo", "domingo"), ("Segunda", "segunda")]
 
-NOMES_TURNOS = {
-    "T1": "Turno 1",
-    "T2": "Turno 2",
-    "T3": "Turno 3",
-}
-
-DIAS = [
-    ("Sexta", "sexta"),
-    ("Sábado", "sabado"),
-    ("Domingo", "domingo"),
-    ("Segunda", "segunda"),
-]
-
+# Ordem de exibição por função (mais específico primeiro, para evitar
+# que "SEGURANÇA/ELOG" seja classificado como "SEGURANÇA")
 ORDEM_FUNCOES = [
     ("LÍDER", 0),
     ("ANALISTA", 1),
@@ -216,9 +197,19 @@ ORDEM_FUNCOES = [
     ("SEGURANÇA", 5),
 ]
 
+def prioridade_funcao(funcao):
+    funcao_upper = funcao.upper()
+    for palavra_chave, prioridade in ORDEM_FUNCOES:
+        if palavra_chave in funcao_upper:
+            return prioridade
+    return 99  # funções não mapeadas ficam no final
+
+def ordenar_por_funcao(lista_operadores):
+    # x = (id, nome, funcao, turno) — ordena por prioridade da função, depois por nome
+    return sorted(lista_operadores, key=lambda x: (prioridade_funcao(x[2]), x[1]))
 
 # ============================================================
-# ESTILO
+# TEMA ESCURO (CSS)
 # ============================================================
 st.markdown("""
 <style>
@@ -292,6 +283,7 @@ label, .stMarkdown, p { color: #C7D0DD; }
     border-radius: 9px;
     box-shadow: 0 2px 8px rgba(0,0,0,0.25);
 }
+
 .turno-titulo { font-size: 21px; font-weight: 800; color: #FFFFFF; }
 .turno-horario {
     background-color: #243553;
@@ -303,14 +295,7 @@ label, .stMarkdown, p { color: #C7D0DD; }
     font-weight: 800;
 }
 
-.header-col {
-    text-align: center;
-    font-weight: 800;
-    font-size: 11px;
-    color: #8794A6;
-    margin-bottom: 8px;
-    letter-spacing: 0.4px;
-}
+.header-col { text-align: center; font-weight: 800; font-size: 11px; color: #8794A6; margin-bottom: 8px; letter-spacing: 0.4px; }
 .header-esquerda { text-align: left; }
 .nome-operador { padding-top: 9px; font-size: 13px; color: #FFFFFF; }
 .funcao-operador { padding-top: 9px; font-size: 11px; color: #4EA8E0; font-weight: 700; }
@@ -333,6 +318,7 @@ label, .stMarkdown, p { color: #C7D0DD; }
     justify-content: center;
     box-shadow: 0 2px 6px rgba(0,0,0,0.22);
 }
+
 .card-folga {
     background-color: #D9A227;
     color: #1B2438;
@@ -366,12 +352,7 @@ label, .stMarkdown, p { color: #C7D0DD; }
 .metric-numero { font-size: 22px; font-weight: 800; color: #FFFFFF; }
 .metric-label { font-size: 11px; color: #8794A6; font-weight: 700; }
 
-[data-testid="stForm"] {
-    background-color: #182238;
-    border: 1px solid #2A3855;
-    padding: 16px;
-    border-radius: 10px;
-}
+[data-testid="stForm"] { background-color: #182238; border: 1px solid #2A3855; padding: 16px; border-radius: 10px; }
 .stButton > button {
     border-radius: 7px;
     font-weight: 700;
@@ -392,7 +373,6 @@ div[data-testid="stDownloadButton"] > button:hover {
     border-color: #4EA8E0 !important;
     color: #4EA8E0 !important;
 }
-
 div[data-testid="column"] .stButton > button { color: #C7D0DD; }
 .stMainBlockContainer { padding-top: 25px !important; padding-bottom: 30px !important; }
 .stCaption { color: #5B6779 !important; }
@@ -403,6 +383,7 @@ div[data-testid="stPopover"] button {
     border: 1px solid #FF9900 !important;
     font-weight: 800 !important;
     border-radius: 8px !important;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
 }
 div[data-testid="stPopover"] button p { color: #1A1A1A !important; }
 div[data-testid="stPopover"] button:hover {
@@ -412,6 +393,7 @@ div[data-testid="stPopover"] button:hover {
 }
 div[data-testid="stPopover"] button:hover p { color: #0B3C5D !important; }
 
+/* Conteúdo do popover (renderizado fora do container principal) */
 div[data-testid="stPopoverBody"],
 div[data-baseweb="popover"] div[role="tooltip"] {
     background-color: #182238 !important;
@@ -419,15 +401,57 @@ div[data-baseweb="popover"] div[role="tooltip"] {
     border-radius: 12px !important;
 }
 div[data-testid="stPopoverBody"] * ,
-div[data-baseweb="popover"] div[role="tooltip"] * { color: #E7ECF3; }
-
+div[data-baseweb="popover"] div[role="tooltip"] * {
+    color: #E7ECF3;
+}
+div[data-testid="stPopoverBody"] label,
+div[data-baseweb="popover"] div[role="tooltip"] label {
+    color: #C7D0DD !important;
+}
 div[data-testid="stPopoverBody"] input,
 div[data-baseweb="popover"] div[role="tooltip"] input {
     background-color: #101A2C !important;
     color: #E7ECF3 !important;
     border: 1px solid #33415F !important;
 }
+div[data-testid="stPopoverBody"] div[data-baseweb="input"],
+div[data-baseweb="popover"] div[role="tooltip"] div[data-baseweb="input"] {
+    background-color: #101A2C !important;
+    border-radius: 7px !important;
+}
+div[data-testid="stPopoverBody"] div[data-baseweb="base-input"],
+div[data-baseweb="popover"] div[role="tooltip"] div[data-baseweb="base-input"] {
+    background-color: #101A2C !important;
+}
+div[data-testid="stPopoverBody"] button[kind="secondaryFormSubmit"],
+div[data-testid="stPopoverBody"] div[data-testid="stFormSubmitButton"] > button,
+div[data-baseweb="popover"] div[role="tooltip"] div[data-testid="stFormSubmitButton"] > button {
+    background-color: #FF9900 !important;
+    color: #101A2C !important;
+    border: 1px solid #FF9900 !important;
+    font-weight: 800 !important;
+}
+div[data-testid="stPopoverBody"] div[data-testid="stFormSubmitButton"] > button p,
+div[data-baseweb="popover"] div[role="tooltip"] div[data-testid="stFormSubmitButton"] > button p {
+    color: #101A2C !important;
+}
+div[data-testid="stPopoverBody"] svg,
+div[data-baseweb="popover"] div[role="tooltip"] svg {
+    fill: #8794A6 !important;
+}
+div[data-testid="stPopoverBody"] div[data-baseweb="select"] > div,
+div[data-baseweb="popover"] div[role="tooltip"] div[data-baseweb="select"] > div {
+    background-color: #101A2C !important;
+    border: 1px solid #33415F !important;
+    border-radius: 7px !important;
+}
+div[data-testid="stPopoverBody"] div[data-baseweb="select"] *,
+div[data-baseweb="popover"] div[role="tooltip"] div[data-baseweb="select"] * {
+    color: #E7ECF3 !important;
+    background-color: transparent !important;
+}
 
+/* Lista de opções do dropdown (menu flutuante, fora do container principal) */
 ul[data-baseweb="menu"] {
     background-color: #182238 !important;
     border: 1px solid #2A3855 !important;
@@ -440,6 +464,10 @@ ul[data-baseweb="menu"] li:hover {
     background-color: #243553 !important;
     color: #FF9900 !important;
 }
+div[data-testid="stPopoverBody"] hr,
+div[data-baseweb="popover"] div[role="tooltip"] hr {
+    border-color: #2A3855 !important;
+}
 
 [data-testid="stExpander"] {
     background-color: #182238;
@@ -447,6 +475,7 @@ ul[data-baseweb="menu"] li:hover {
     border-radius: 8px;
 }
 
+/* Campo de busca de operador — fundo branco */
 input[placeholder="Nome do operador..."] {
     background-color: #FFFFFF !important;
     color: #101A2C !important;
@@ -455,6 +484,10 @@ input[placeholder="Nome do operador..."] {
 }
 input[placeholder="Nome do operador..."]::placeholder {
     color: #8794A6 !important;
+}
+input[placeholder="Nome do operador..."] + div,
+div:has(> input[placeholder="Nome do operador..."]) {
+    background-color: #FFFFFF !important;
 }
 
 @media (max-width: 800px) {
@@ -466,148 +499,160 @@ input[placeholder="Nome do operador..."]::placeholder {
 </style>
 """, unsafe_allow_html=True)
 
+# ============================================================
+# SESSÃO
+# ============================================================
+if "autenticado" not in st.session_state:
+    st.session_state.autenticado = False
+if "deslocamento_semana" not in st.session_state:
+    st.session_state.deslocamento_semana = 0
 
 # ============================================================
-# FUNÇÕES DE DADOS
+# OPERAÇÕES DE BANCO
 # ============================================================
-def contar_operadores():
-    row = executar(
-        "SELECT COUNT(*) AS total FROM operadores WHERE ativo = TRUE",
-        fetchone=True,
-    )
-    return int(row["total"])
-
-
-def sem_operadores():
-    return contar_operadores() == 0
-
-
-def carregar_dados_iniciais():
-    """Só cria os operadores padrão se o Supabase estiver vazio."""
-    if not sem_operadores():
-        return
-
-    for nome, funcao, turno in FUNCIONARIOS_OFICIAIS:
-        executar(
-            """
-            INSERT INTO operadores (nome, funcao, turno)
-            VALUES (%s, %s, %s)
-            """,
-            (nome, funcao, turno),
-        )
-
-
 def buscar_operadores():
-    rows = executar(
-        """
+    conn = conectar()
+    cursor = conn.cursor()
+    cursor.execute("""
         SELECT id, nome, funcao, turno
         FROM operadores
-        WHERE ativo = TRUE
+        WHERE ativo IS TRUE
         ORDER BY turno, nome
-        """,
-        fetch=True,
-    )
-    return [
-        (int(r["id"]), r["nome"], r["funcao"], r["turno"])
-        for r in rows
-    ]
-
+    """)
+    dados = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return dados
 
 def cadastrar_operador(nome, funcao, turno):
-    executar(
+    conn = conectar()
+    cursor = conn.cursor()
+    cursor.execute(
         """
         INSERT INTO operadores (nome, funcao, turno)
         VALUES (%s, %s, %s)
         """,
-        (nome, funcao, turno),
+        (nome, funcao, turno)
     )
-
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def editar_operador(operador_id, nome, funcao, turno):
-    executar(
+    conn = conectar()
+    cursor = conn.cursor()
+    cursor.execute(
         """
         UPDATE operadores
-        SET nome = %s, funcao = %s, turno = %s, atualizado_em = NOW()
+        SET nome = %s, funcao = %s, turno = %s
         WHERE id = %s
         """,
-        (nome, funcao, turno, operador_id),
+        (nome, funcao, turno, operador_id)
     )
-
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def remover_operador(operador_id):
-    # Remoção lógica: os registros históricos e escalas permanecem.
-    executar(
-        """
-        UPDATE operadores
-        SET ativo = FALSE, atualizado_em = NOW()
-        WHERE id = %s
-        """,
-        (operador_id,),
+    conn = conectar()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE operadores SET ativo = FALSE WHERE id = %s",
+        (operador_id,)
     )
-
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def buscar_status(operador_id, semana_id):
-    row = executar(
+    conn = conectar()
+    cursor = conn.cursor()
+    cursor.execute(
         """
         SELECT sexta, sabado, domingo, segunda
         FROM escala
         WHERE operador_id = %s AND semana_id = %s
         """,
-        (operador_id, semana_id),
-        fetchone=True,
+        (operador_id, semana_id)
     )
-
-    if row is None:
-        return None
-
-    return (
-        row["sexta"],
-        row["sabado"],
-        row["domingo"],
-        row["segunda"],
-    )
-
+    resultado = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return resultado
 
 def salvar_status(operador_id, semana_id, sexta, sabado, domingo, segunda):
-    executar(
-        """
-        INSERT INTO escala (
-            operador_id, semana_id,
-            sexta, sabado, domingo, segunda,
-            atualizado_em
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, NOW())
-        ON CONFLICT (operador_id, semana_id)
-        DO UPDATE SET
-            sexta = EXCLUDED.sexta,
-            sabado = EXCLUDED.sabado,
-            domingo = EXCLUDED.domingo,
-            segunda = EXCLUDED.segunda,
-            atualizado_em = NOW()
-        """,
-        (
-            operador_id,
-            semana_id,
-            sexta,
-            sabado,
-            domingo,
-            segunda,
-        ),
-    )
+    conn = conectar()
+    cursor = conn.cursor()
 
+    cursor.execute(
+        """
+        SELECT id
+        FROM escala
+        WHERE operador_id = %s AND semana_id = %s
+        """,
+        (operador_id, semana_id)
+    )
+    existente = cursor.fetchone()
+
+    if existente:
+        cursor.execute(
+            """
+            UPDATE escala
+            SET sexta = %s,
+                sabado = %s,
+                domingo = %s,
+                segunda = %s
+            WHERE operador_id = %s AND semana_id = %s
+            """,
+            (
+                sexta,
+                sabado,
+                domingo,
+                segunda,
+                operador_id,
+                semana_id
+            )
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO escala (
+                operador_id,
+                semana_id,
+                sexta,
+                sabado,
+                domingo,
+                segunda
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                operador_id,
+                semana_id,
+                sexta,
+                sabado,
+                domingo,
+                segunda
+            )
+        )
+
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def registrar_historico(
-    operador_id,
     operador_nome,
     semana_id,
     dia,
     de_status,
-    para_status,
+    para_status
 ):
-    executar(
+    conn = conectar()
+    cursor = conn.cursor()
+    cursor.execute(
         """
         INSERT INTO historico (
-            operador_id,
+            data_hora,
             operador_nome,
             semana_id,
             dia,
@@ -617,18 +662,22 @@ def registrar_historico(
         VALUES (%s, %s, %s, %s, %s, %s)
         """,
         (
-            operador_id,
+            datetime.now().strftime("%d/%m/%Y %H:%M"),
             operador_nome,
             semana_id,
             dia,
             de_status,
-            para_status,
-        ),
+            para_status
+        )
     )
-
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def buscar_historico(limite=50):
-    rows = executar(
+    conn = conectar()
+    cursor = conn.cursor()
+    cursor.execute(
         """
         SELECT
             data_hora,
@@ -641,35 +690,20 @@ def buscar_historico(limite=50):
         ORDER BY id DESC
         LIMIT %s
         """,
-        (limite,),
-        fetch=True,
+        (limite,)
     )
-    return [
-        (
-            r["data_hora"].strftime("%d/%m/%Y %H:%M")
-            if hasattr(r["data_hora"], "strftime")
-            else str(r["data_hora"]),
-            r["operador_nome"],
-            str(r["semana_id"]),
-            r["dia"],
-            r["de_status"],
-            r["para_status"],
-        )
-        for r in rows
-    ]
-
+    dados = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return dados
 
 # ============================================================
-# DATAS
+# DATAS DA ESCALA
 # ============================================================
 def obter_semana(deslocamento=0):
     hoje = datetime.now()
     dias_para_sexta = (hoje.weekday() - 4) % 7
-    sexta = (
-        hoje
-        - timedelta(days=dias_para_sexta)
-        + timedelta(weeks=deslocamento)
-    )
+    sexta = hoje - timedelta(days=dias_para_sexta) + timedelta(weeks=deslocamento)
     sabado = sexta + timedelta(days=1)
     domingo = sexta + timedelta(days=2)
     segunda = sexta + timedelta(days=3)
@@ -680,105 +714,48 @@ def obter_semana(deslocamento=0):
         "Sexta": sexta.strftime("%d/%m"),
         "Sábado": sabado.strftime("%d/%m"),
         "Domingo": domingo.strftime("%d/%m"),
-        "Segunda": segunda.strftime("%d/%m"),
+        "Segunda": segunda.strftime("%d/%m")
     }
 
-
-def prioridade_funcao(funcao):
-    funcao_upper = funcao.upper()
-    for palavra_chave, prioridade in ORDEM_FUNCOES:
-        if palavra_chave in funcao_upper:
-            return prioridade
-    return 99
-
-
-def ordenar_por_funcao(lista_operadores):
-    return sorted(
-        lista_operadores,
-        key=lambda x: (prioridade_funcao(x[2]), x[1]),
-    )
-
+semana = obter_semana(st.session_state.deslocamento_semana)
+semana_id = semana["id"]
 
 # ============================================================
-# EXPORTAÇÃO
+# EXPORTAÇÃO PARA EXCEL (NOVA FUNCIONALIDADE)
 # ============================================================
 def gerar_excel(operadores, semana):
     linhas = []
-
     for operador_id, nome, funcao, turno in operadores:
         status = buscar_status(operador_id, semana["id"])
-
         if status is None:
             horario = HORARIOS[turno]
             status = (horario, horario, horario, horario)
-
-        linhas.append({
+        linha = {
             "Turno": NOMES_TURNOS[turno],
             "Operador": nome,
             "Função": funcao,
-            f"Sexta ({semana['Sexta']})":
-                "FOLGA" if status[0] == "FOLGA" else "TRABALHO",
-            f"Sábado ({semana['Sábado']})":
-                "FOLGA" if status[1] == "FOLGA" else "TRABALHO",
-            f"Domingo ({semana['Domingo']})":
-                "FOLGA" if status[2] == "FOLGA" else "TRABALHO",
-            f"Segunda ({semana['Segunda']})":
-                "FOLGA" if status[3] == "FOLGA" else "TRABALHO",
-        })
-
+            f"Sexta ({semana['Sexta']})": "FOLGA" if status[0] == "FOLGA" else "TRABALHO",
+            f"Sábado ({semana['Sábado']})": "FOLGA" if status[1] == "FOLGA" else "TRABALHO",
+            f"Domingo ({semana['Domingo']})": "FOLGA" if status[2] == "FOLGA" else "TRABALHO",
+            f"Segunda ({semana['Segunda']})": "FOLGA" if status[3] == "FOLGA" else "TRABALHO",
+        }
+        linhas.append(linha)
     df = pd.DataFrame(linhas)
     buffer = io.BytesIO()
-
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Escala")
-
     buffer.seek(0)
     return buffer
-
-
-# ============================================================
-# INICIALIZAÇÃO SEGURA
-# ============================================================
-try:
-    criar_banco()
-    carregar_dados_iniciais()
-except Exception as e:
-    st.error("Não foi possível conectar ao banco do Supabase.")
-    st.code(str(e))
-    st.stop()
-
-
-# ============================================================
-# SESSÃO
-# ============================================================
-if "autenticado" not in st.session_state:
-    st.session_state.autenticado = False
-
-if "deslocamento_semana" not in st.session_state:
-    st.session_state.deslocamento_semana = 0
-
 
 # ============================================================
 # TOP BAR
 # ============================================================
-semana = obter_semana(st.session_state.deslocamento_semana)
-semana_id = semana["id"]
-
 col_tit, col_log = st.columns([4, 1], vertical_alignment="center")
 
 with col_tit:
-    st.markdown(
-        "<div class='subtitulo-tag'>ESCALA OPERACIONAL</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        "<div class='titulo'>Monitoramento - amazon</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        "<div class='subtitulo'>Selecione o período da escala</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("<div class='subtitulo-tag'>ESCALA OPERACIONAL</div>", unsafe_allow_html=True)
+    st.markdown("<div class='titulo'>Monitoramento - amazon</div>", unsafe_allow_html=True)
+    st.markdown("<div class='subtitulo'>Selecione o período da escala</div>", unsafe_allow_html=True)
 
 with col_log:
     if not st.session_state.autenticado:
@@ -786,10 +763,7 @@ with col_log:
             with st.form("login_form", clear_on_submit=True):
                 usuario = st.text_input("Usuário")
                 senha = st.text_input("Senha", type="password")
-                entrar = st.form_submit_button(
-                    "Entrar",
-                    use_container_width=True,
-                )
+                entrar = st.form_submit_button("Entrar", use_container_width=True)
 
                 if entrar:
                     usuario_ok = st.secrets["auth"]["usuario"]
@@ -810,204 +784,105 @@ with col_log:
 
             menu_admin = st.selectbox(
                 "O que deseja fazer?",
-                [
-                    "Adicionar Operador",
-                    "Editar Operador",
-                    "Remover Operador",
-                    "Histórico de Alterações",
-                ],
+                ["Adicionar Operador", "Editar Operador", "Remover Operador", "Histórico de Alterações"]
             )
 
             if menu_admin == "Adicionar Operador":
                 novo_nome = st.text_input("Nome").strip().upper()
                 nova_funcao = st.text_input("Função").strip().upper()
                 novo_turno = st.selectbox(
-                    "Turno",
-                    ["T1", "T2", "T3"],
-                    format_func=lambda x:
-                        f"{NOMES_TURNOS[x]} — {HORARIOS[x]}",
+                    "Turno", ["T1", "T2", "T3"],
+                    format_func=lambda x: f"{NOMES_TURNOS[x]} — {HORARIOS[x]}"
                 )
-
-                if st.button(
-                    "Confirmar Cadastro",
-                    use_container_width=True,
-                ):
+                if st.button("Confirmar Cadastro", use_container_width=True):
                     if novo_nome and nova_funcao:
-                        cadastrar_operador(
-                            novo_nome,
-                            nova_funcao,
-                            novo_turno,
-                        )
-                        st.success("Operador cadastrado no Supabase!")
+                        cadastrar_operador(novo_nome, nova_funcao, novo_turno)
+                        st.success("Operador cadastrado!")
                         st.rerun()
                     else:
                         st.warning("Preencha todos os campos.")
 
             elif menu_admin == "Editar Operador":
                 operadores_lista = buscar_operadores()
-
                 if operadores_lista:
-                    opcoes_edicao = {
-                        f"{x[1]} — {x[2]}": x
-                        for x in operadores_lista
-                    }
-
-                    selecionado = st.selectbox(
-                        "Selecione o operador",
-                        list(opcoes_edicao.keys()),
-                    )
-
+                    opcoes_edicao = {f"{x[1]} — {x[2]}": x for x in operadores_lista}
+                    selecionado = st.selectbox("Selecione o operador", list(opcoes_edicao.keys()))
                     op_sel = opcoes_edicao[selecionado]
-
-                    nome_edit = st.text_input(
-                        "Nome",
-                        value=op_sel[1],
-                    ).strip().upper()
-
-                    funcao_edit = st.text_input(
-                        "Função",
-                        value=op_sel[2],
-                    ).strip().upper()
-
+                    nome_edit = st.text_input("Nome", value=op_sel[1]).strip().upper()
+                    funcao_edit = st.text_input("Função", value=op_sel[2]).strip().upper()
                     turno_edit = st.selectbox(
-                        "Turno",
-                        ["T1", "T2", "T3"],
+                        "Turno", ["T1", "T2", "T3"],
                         index=["T1", "T2", "T3"].index(op_sel[3]),
-                        format_func=lambda x:
-                            f"{NOMES_TURNOS[x]} — {HORARIOS[x]}",
+                        format_func=lambda x: f"{NOMES_TURNOS[x]} — {HORARIOS[x]}"
                     )
-
-                    if st.button(
-                        "Salvar Alterações",
-                        use_container_width=True,
-                    ):
-                        editar_operador(
-                            op_sel[0],
-                            nome_edit,
-                            funcao_edit,
-                            turno_edit,
-                        )
-                        st.success("Operador atualizado no Supabase!")
+                    if st.button("Salvar Alterações", use_container_width=True):
+                        editar_operador(op_sel[0], nome_edit, funcao_edit, turno_edit)
+                        st.success("Operador atualizado!")
                         st.rerun()
                 else:
                     st.info("Nenhum operador cadastrado.")
 
             elif menu_admin == "Remover Operador":
                 operadores_lista = buscar_operadores()
-
                 if operadores_lista:
-                    opcoes_remocao = {
-                        f"{x[1]} — {x[2]}": x[0]
-                        for x in operadores_lista
-                    }
-
-                    selecionado = st.selectbox(
-                        "Selecione o operador",
-                        list(opcoes_remocao.keys()),
-                    )
-
-                    if st.button(
-                        "Confirmar Remoção",
-                        use_container_width=True,
-                    ):
-                        remover_operador(
-                            opcoes_remocao[selecionado]
-                        )
-                        st.success(
-                            "Operador removido da escala ativa. "
-                            "Histórico preservado."
-                        )
+                    opcoes_remocao = {f"{x[1]} — {x[2]}": x[0] for x in operadores_lista}
+                    selecionado = st.selectbox("Selecione o operador", list(opcoes_remocao.keys()))
+                    if st.button("Confirmar Remoção", use_container_width=True):
+                        remover_operador(opcoes_remocao[selecionado])
+                        st.success("Operador removido!")
                         st.rerun()
                 else:
                     st.info("Nenhum operador cadastrado.")
 
             elif menu_admin == "Histórico de Alterações":
                 hist = buscar_historico(30)
-
                 if hist:
-                    for (
-                        data_hora,
-                        nome,
-                        sem_id,
-                        dia,
-                        de,
-                        para,
-                    ) in hist:
-                        st.caption(
-                            f"**{data_hora}** — {nome} · {dia} "
-                            f"({sem_id}): {de} → {para}"
-                        )
+                    for data_hora, nome, sem_id, dia, de, para in hist:
+                        st.caption(f"**{data_hora}** — {nome} · {dia} ({sem_id}): {de} → {para}")
                 else:
                     st.info("Nenhuma alteração registrada ainda.")
 
             st.divider()
-
             if st.button("🚪 Sair", use_container_width=True):
                 st.session_state.autenticado = False
                 st.rerun()
 
-
 # ============================================================
-# NAVEGAÇÃO + BUSCA + EXPORTAÇÃO
+# NAVEGAÇÃO DE SEMANA + BUSCA (NOVA FUNCIONALIDADE)
 # ============================================================
-col_prev, col_periodo, col_next, col_busca, col_export = st.columns(
-    [0.5, 2, 0.5, 2.3, 0.45],
-    gap="small",
-)
+col_prev, col_periodo, col_next, col_busca, col_export = st.columns([0.5, 2, 0.5, 2.3, 0.45], gap="small")
 
 with col_prev:
     if st.button("◀", use_container_width=True):
         st.session_state.deslocamento_semana -= 1
         st.rerun()
-
 with col_periodo:
     st.markdown(
-        f"""
-        <div style='background-color:#182238;
-        border:1px solid #2A3855;border-radius:8px;
-        padding:9px 14px;color:#E7ECF3;
-        font-weight:700;text-align:center;'>
-        📅 {semana['nome']}
-        </div>
-        """,
-        unsafe_allow_html=True,
+        f"<div style='background-color:#182238;border:1px solid #2A3855;border-radius:8px;"
+        f"padding:9px 14px;color:#E7ECF3;font-weight:700;text-align:center;'>📅 {semana['nome']}</div>",
+        unsafe_allow_html=True
     )
-
 with col_next:
     if st.button("▶", use_container_width=True):
         st.session_state.deslocamento_semana += 1
         st.rerun()
-
 with col_busca:
-    termo_busca = st.text_input(
-        "🔎 Buscar operador",
-        placeholder="Nome do operador...",
-        label_visibility="collapsed",
-    )
+    termo_busca = st.text_input("🔎 Buscar operador", placeholder="Nome do operador...", label_visibility="collapsed")
 
 operadores = buscar_operadores()
-
 if termo_busca:
-    operadores = [
-        x for x in operadores
-        if termo_busca.strip().upper() in x[1].upper()
-    ]
+    operadores = [x for x in operadores if termo_busca.strip().upper() in x[1].upper()]
 
 with col_export:
     excel_buffer = gerar_excel(operadores, semana)
-
     st.download_button(
         label="⬇️",
         data=excel_buffer,
         file_name=f"escala_amazon_{semana_id}.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
-        help="Exportar escala para Excel",
+        help="Exportar escala para Excel"
     )
-
 
 # ============================================================
 # MÉTRICAS
@@ -1018,163 +893,55 @@ t2 = len([x for x in operadores if x[3] == "T2"])
 t3 = len([x for x in operadores if x[3] == "T3"])
 
 m1, m2, m3, m4 = st.columns(4)
+with m1: st.markdown(f"<div class='metric-card'><div class='metric-numero'>{total}</div><div class='metric-label'>OPERADORES TOTAL</div></div>", unsafe_allow_html=True)
+with m2: st.markdown(f"<div class='metric-card'><div class='metric-numero'>{t1}</div><div class='metric-label'>T1 • 07h às 15h</div></div>", unsafe_allow_html=True)
+with m3: st.markdown(f"<div class='metric-card'><div class='metric-numero'>{t2}</div><div class='metric-label'>T2 • 15h às 23h</div></div>", unsafe_allow_html=True)
+with m4: st.markdown(f"<div class='metric-card'><div class='metric-numero'>{t3}</div><div class='metric-label'>T3 • 23h às 07h</div></div>", unsafe_allow_html=True)
 
-with m1:
-    st.markdown(
-        f"""
-        <div class='metric-card'>
-            <div class='metric-numero'>{total}</div>
-            <div class='metric-label'>OPERADORES TOTAL</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with m2:
-    st.markdown(
-        f"""
-        <div class='metric-card'>
-            <div class='metric-numero'>{t1}</div>
-            <div class='metric-label'>T1 • 07h às 15h</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with m3:
-    st.markdown(
-        f"""
-        <div class='metric-card'>
-            <div class='metric-numero'>{t2}</div>
-            <div class='metric-label'>T2 • 15h às 23h</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with m4:
-    st.markdown(
-        f"""
-        <div class='metric-card'>
-            <div class='metric-numero'>{t3}</div>
-            <div class='metric-label'>T3 • 23h às 07h</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+st.write("")
 
 # ============================================================
 # GRID DE TURNOS
 # ============================================================
-st.write("")
-
-aba_t1, aba_t2, aba_t3 = st.tabs(
-    ["Turno 1", "Turno 2", "Turno 3"]
-)
-
-abas_mapeamento = {
-    "T1": aba_t1,
-    "T2": aba_t2,
-    "T3": aba_t3,
-}
+aba_t1, aba_t2, aba_t3 = st.tabs(["Turno 1", "Turno 2", "Turno 3"])
+abas_mapeamento = {"T1": aba_t1, "T2": aba_t2, "T3": aba_t3}
 
 for turno in ["T1", "T2", "T3"]:
     with abas_mapeamento[turno]:
-        operadores_turno = ordenar_por_funcao(
-            [x for x in operadores if x[3] == turno]
-        )
+        operadores_turno = ordenar_por_funcao([x for x in operadores if x[3] == turno])
 
         if not operadores_turno:
-            st.info(
-                f"Nenhum operador encontrado no "
-                f"{NOMES_TURNOS[turno]} para este filtro/período."
-            )
+            st.info(f"Nenhum operador encontrado no {NOMES_TURNOS[turno]} para este filtro/período.")
             continue
 
-        st.markdown(
-            f"""
+        st.markdown(f"""
             <div class='turno-header'>
-                <div class='turno-titulo'>
-                    🕒 {NOMES_TURNOS[turno]}
-                </div>
-                <div class='turno-horario'>
-                    {HORARIOS[turno]}
-                </div>
+                <div class='turno-titulo'>🕒 {NOMES_TURNOS[turno]}</div>
+                <div class='turno-horario'>{HORARIOS[turno]}</div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        """, unsafe_allow_html=True)
 
-        headers = st.columns(
-            [2.5, 2, 1.8, 1.8, 1.8, 1.8]
-        )
-
-        headers[0].markdown(
-            "<div class='header-col header-esquerda'>"
-            "OPERADOR</div>",
-            unsafe_allow_html=True,
-        )
-
-        headers[1].markdown(
-            "<div class='header-col header-esquerda'>"
-            "FUNÇÃO</div>",
-            unsafe_allow_html=True,
-        )
+        headers = st.columns([2.5, 2, 1.8, 1.8, 1.8, 1.8])
+        headers[0].markdown("<div class='header-col header-esquerda'>OPERADOR</div>", unsafe_allow_html=True)
+        headers[1].markdown("<div class='header-col header-esquerda'>FUNÇÃO</div>", unsafe_allow_html=True)
 
         for i, (dia, _) in enumerate(DIAS, 2):
-            headers[i].markdown(
-                f"<div class='header-col'>"
-                f"{dia.upper()} ({semana[dia]})</div>",
-                unsafe_allow_html=True,
-            )
+            headers[i].markdown(f"<div class='header-col'>{dia.upper()} ({semana[dia]})</div>", unsafe_allow_html=True)
 
-        st.markdown(
-            "<div class='separador'></div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div class='separador'></div>", unsafe_allow_html=True)
 
         for operador in operadores_turno:
-            operador_id = operador[0]
-            nome = operador[1]
-            funcao = operador[2]
+            operador_id, nome, funcao = operador[0], operador[1], operador[2]
+            status = buscar_status(operador_id, semana_id)
 
-            status = buscar_status(
-                operador_id,
-                semana_id,
-            )
-
-            # Primeira abertura da semana:
-            # cria somente o registro daquela escala no Supabase.
             if status is None:
                 horario = HORARIOS[turno]
-                status = (
-                    horario,
-                    horario,
-                    horario,
-                    horario,
-                )
-                salvar_status(
-                    operador_id,
-                    semana_id,
-                    *status,
-                )
+                status = (horario, horario, horario, horario)
+                salvar_status(operador_id, semana_id, *status)
 
-            linha = st.columns(
-                [2.5, 2, 1.8, 1.8, 1.8, 1.8]
-            )
-
-            linha[0].markdown(
-                f"<div class='nome-operador'>"
-                f"<b>{nome}</b></div>",
-                unsafe_allow_html=True,
-            )
-
-            linha[1].markdown(
-                f"<div class='funcao-operador'>"
-                f"{funcao}</div>",
-                unsafe_allow_html=True,
-            )
+            linha = st.columns([2.5, 2, 1.8, 1.8, 1.8, 1.8])
+            linha[0].markdown(f"<div class='nome-operador'><b>{nome}</b></div>", unsafe_allow_html=True)
+            linha[1].markdown(f"<div class='funcao-operador'>{funcao}</div>", unsafe_allow_html=True)
 
             status_lista = list(status)
 
@@ -1182,65 +949,25 @@ for turno in ["T1", "T2", "T3"]:
                 valor = status_lista[i - 2]
 
                 if valor != "FOLGA":
-                    linha[i].markdown(
-                        f"""
+                    linha[i].markdown(f"""
                         <div class='card-trabalho'>
                             {HORARIOS[turno]}
                         </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+                    """, unsafe_allow_html=True)
                 else:
-                    linha[i].markdown(
-                        """
+                    linha[i].markdown("""
                         <div class='card-folga'>
                             Folga descanso
                         </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+                    """, unsafe_allow_html=True)
 
                 if st.session_state.autenticado:
-                    novo_valor = (
-                        HORARIOS[turno]
-                        if valor == "FOLGA"
-                        else "FOLGA"
-                    )
-
-                    if linha[i].button(
-                        "↔ Alterar",
-                        key=(
-                            f"{operador_id}_"
-                            f"{semana_id}_"
-                            f"{dia}_"
-                            f"{turno}"
-                        ),
-                        use_container_width=True,
-                    ):
-                        registrar_historico(
-                            operador_id,
-                            nome,
-                            semana_id,
-                            dia,
-                            valor,
-                            novo_valor,
-                        )
-
+                    novo_valor = HORARIOS[turno] if valor == "FOLGA" else "FOLGA"
+                    if linha[i].button("↔ Alterar", key=f"{operador_id}_{semana_id}_{dia}_{turno}", use_container_width=True):
+                        registrar_historico(nome, semana_id, dia, valor, novo_valor)
                         status_lista[i - 2] = novo_valor
-
-                        salvar_status(
-                            operador_id,
-                            semana_id,
-                            *status_lista,
-                        )
-
+                        salvar_status(operador_id, semana_id, *status_lista)
                         st.rerun()
 
-
-# ============================================================
-# RODAPÉ
-# ============================================================
 st.divider()
-st.caption(
-    "Escala Amazon • Dados persistidos no Supabase/PostgreSQL"
-)
+st.caption("Escala Amazon • Sistema independente de gestão de escala")
