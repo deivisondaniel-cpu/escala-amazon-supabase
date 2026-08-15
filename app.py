@@ -1771,20 +1771,19 @@ for turno in ["T1", "T2", "T3"]:
             continue
 
 
-        st.markdown(
-            f"""
-            <div class='turno-header'>
-                <div class='turno-titulo'>
-                    🕒 {NOMES_TURNOS[turno]}
-                </div>
-
-                <div class='turno-horario'>
-                    {HORARIOS[turno]}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+st.markdown(
+    f"""
+    <div class='turno-header'>
+        <div class='turno-titulo'>
+            🕒 {NOMES_TURNOS[turno]}
+        </div>
+        <div class='turno-horario'>
+            {HORARIOS[turno]}
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 
         headers = st.columns([
