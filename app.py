@@ -24,8 +24,44 @@ DB_URL = st.secrets["connections"]["supabase_db"]["url"]
 # CONEXÃO COM SUPABASE / POSTGRESQL
 # ============================================================
 def conectar():
-    """Abre uma conexão com o PostgreSQL do Supabase."""
-    return psycopg2.connect(DB_URL, connect_timeout=10)
+    """
+    Abre uma conexão com o PostgreSQL do Supabase.
+
+    A URL é desmontada manualmente porque senhas de banco podem
+    conter caracteres codificados, como %40 para @. Isso evita o
+    erro do psycopg2 do tipo "missing = after ...".
+    """
+    from urllib.parse import urlparse, unquote
+
+    url = urlparse(str(DB_URL).strip())
+
+    if url.scheme not in ("postgresql", "postgres"):
+        raise ValueError(
+            "A URL do Supabase precisa começar com "
+            "'postgresql://' ou 'postgres://'."
+        )
+
+    host = url.hostname
+    port = url.port or 5432
+    database = url.path.lstrip("/") or "postgres"
+    user = unquote(url.username or "")
+    password = unquote(url.password or "")
+
+    if not host or not user or not password:
+        raise ValueError(
+            "A connection string do Supabase está incompleta. "
+            "Confira usuário, senha e host nos Secrets."
+        )
+
+    return psycopg2.connect(
+        host=host,
+        port=port,
+        database=database,
+        user=user,
+        password=password,
+        connect_timeout=10,
+        sslmode="require",
+    )
 
 
 def executar(query, params=None, fetch=False, fetchone=False):
