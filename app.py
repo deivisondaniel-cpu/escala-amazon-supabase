@@ -53,7 +53,7 @@ def conectar():
             "Confira usuário, senha e host nos Secrets."
         )
 
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=host,
         port=port,
         database=database,
@@ -61,7 +61,14 @@ def conectar():
         password=password,
         connect_timeout=10,
         sslmode="require",
+        client_encoding="UTF8",
     )
+
+    # Garante UTF-8 mesmo quando o pooler não informa o encoding
+    # automaticamente durante o handshake.
+    conn.set_client_encoding("UTF8")
+
+    return conn
 
 
 def executar(query, params=None, fetch=False, fetchone=False):
