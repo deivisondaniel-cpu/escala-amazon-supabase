@@ -1,5 +1,3 @@
-OFICIAL
-
 import io
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
