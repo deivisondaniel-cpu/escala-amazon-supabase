@@ -4,6 +4,7 @@ from urllib.parse import urlparse, unquote
 
 import pandas as pd
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
 import streamlit as st
 
 # ============================================================
@@ -21,157 +22,123 @@ st.set_page_config(
 # ============================================================
 DB_URL = st.secrets["connections"]["supabase_db"]["url"]
 
-def conectar():
-    """Abre uma conexão persistente com o PostgreSQL do Supabase."""
-    url = urlparse(str(DB_URL).strip())
-
-    if url.scheme not in ("postgresql", "postgres"):
-        raise ValueError(
-            "A URL do Supabase precisa começar com "
-            "'postgresql://' ou 'postgres://'."
-        )
-
-    host = url.hostname
-    port = url.port or 5432
-    database = url.path.lstrip("/") or "postgres"
-    user = unquote(url.username or "")
-    password = unquote(url.password or "")
-
-    if not host or not user or not password:
-        raise ValueError(
-            "A connection string do Supabase está incompleta. "
-            "Confira usuário, senha e host nos Secrets."
-        )
-
-    conn = psycopg2.connect(
-        host=host,
-        port=port,
-        dbname=database,
-        user=user,
-        password=password,
-        connect_timeout=15,
+@st.cache_resource(show_spinner=False)
+def get_pool():
+    """Cria um pool de conexões reutilizável pelo app."""
+    return ThreadedConnectionPool(
+        minconn=1,
+        maxconn=5,
+        dsn=str(DB_URL).strip(),
+        connect_timeout=10,
         sslmode="require",
+        options="-c client_encoding=UTF8",
     )
-    conn.set_client_encoding("UTF8")
-    return conn
 
+class PooledConnection:
+    """Wrapper: conn.close() devolve a conexão ao pool em vez de destruí-la."""
+    def __init__(self, pool, conn):
+        self._pool = pool
+        self._conn = conn
+        self._returned = False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def close(self):
+        if not self._returned:
+            self._returned = True
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+
+def conectar():
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        conn.set_client_encoding("UTF8")
+        return PooledConnection(pool, conn)
+    except Exception:
+        pool.putconn(conn, close=True)
+        raise
+
+@st.cache_resource(show_spinner=False)
 def criar_banco_do_zero():
     """
-    Cria as tabelas somente se elas ainda não existirem.
-    Se já existirem, NÃO apaga nem recria dados.
+    Executa a preparação do banco apenas uma vez por processo.
+    Não recria nem apaga dados existentes.
     """
     conn = conectar()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS operadores (
-            id BIGSERIAL PRIMARY KEY,
-            nome TEXT NOT NULL,
-            funcao TEXT NOT NULL,
-            turno TEXT NOT NULL,
-            ativo BOOLEAN NOT NULL DEFAULT TRUE
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS escala (
-            id BIGSERIAL PRIMARY KEY,
-            operador_id BIGINT NOT NULL,
-            semana_id TEXT NOT NULL,
-            sexta TEXT NOT NULL,
-            sabado TEXT NOT NULL,
-            domingo TEXT NOT NULL,
-            segunda TEXT NOT NULL
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS historico (
-            id BIGSERIAL PRIMARY KEY,
-            data_hora TEXT NOT NULL,
-            operador_nome TEXT NOT NULL,
-            semana_id TEXT NOT NULL,
-            dia TEXT NOT NULL,
-            de_status TEXT NOT NULL,
-            para_status TEXT NOT NULL
-        )
-    """)
-
-    conn.commit()
-
-    # Compatibilidade com a tabela já existente no Supabase:
-    # ativo pode ter sido criado como INTEGER (0/1).
-    cursor.execute("""
-        SELECT data_type
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'operadores'
-          AND column_name = 'ativo'
-    """)
-    tipo_ativo = cursor.fetchone()
-
-    if tipo_ativo and tipo_ativo[0] in ("integer", "bigint", "smallint"):
         cursor.execute("""
-            ALTER TABLE public.operadores
-            ALTER COLUMN ativo DROP DEFAULT
+            CREATE TABLE IF NOT EXISTS operadores (
+                id BIGSERIAL PRIMARY KEY,
+                nome TEXT NOT NULL,
+                funcao TEXT NOT NULL,
+                turno TEXT NOT NULL,
+                ativo BOOLEAN NOT NULL DEFAULT TRUE
+            )
         """)
+
         cursor.execute("""
-            ALTER TABLE public.operadores
-            ALTER COLUMN ativo TYPE BOOLEAN
-            USING (ativo <> 0)
+            CREATE TABLE IF NOT EXISTS escala (
+                id BIGSERIAL PRIMARY KEY,
+                operador_id BIGINT NOT NULL,
+                semana_id TEXT NOT NULL,
+                sexta TEXT NOT NULL,
+                sabado TEXT NOT NULL,
+                domingo TEXT NOT NULL,
+                segunda TEXT NOT NULL,
+                UNIQUE (operador_id, semana_id)
+            )
         """)
+
         cursor.execute("""
-            ALTER TABLE public.operadores
-            ALTER COLUMN ativo SET DEFAULT TRUE
+            CREATE TABLE IF NOT EXISTS historico (
+                id BIGSERIAL PRIMARY KEY,
+                data_hora TEXT NOT NULL,
+                operador_nome TEXT NOT NULL,
+                semana_id TEXT NOT NULL,
+                dia TEXT NOT NULL,
+                de_status TEXT NOT NULL,
+                para_status TEXT NOT NULL
+            )
         """)
+
+        # Compatibilidade com a tabela que já existia.
+        cursor.execute("""
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'operadores'
+              AND column_name = 'ativo'
+        """)
+        tipo_ativo = cursor.fetchone()
+
+        if tipo_ativo and tipo_ativo[0] in ("integer", "bigint", "smallint"):
+            cursor.execute("ALTER TABLE public.operadores ALTER COLUMN ativo DROP DEFAULT")
+            cursor.execute("""
+                ALTER TABLE public.operadores
+                ALTER COLUMN ativo TYPE BOOLEAN
+                USING (ativo <> 0)
+            """)
+            cursor.execute(
+                "ALTER TABLE public.operadores ALTER COLUMN ativo SET DEFAULT TRUE"
+            )
+
         conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-    cursor.execute(
-        "SELECT COUNT(*) FROM operadores WHERE ativo IS TRUE"
-    )
-    dados_existentes = cursor.fetchone()[0]
-
-    if dados_existentes == 0:
-        funcionarios_oficiais = [
-            ("ALAN ARAÚJO", "ANALISTA", "T1"),
-            ("MARGARIDA", "PICKUP", "T1"),
-            ("JOSÉ BRUNO PALHANO", "PICKUP", "T1"),
-            ("CRISTOVÃO MIKELLYS", "DEPART", "T1"),
-            ("PEDRO LUCAS", "DROPOFF", "T1"),
-            ("FELIPE ALLAN", "DROPOFF", "T1"),
-            ("BRUNA BLENDA", "DROPOFF", "T1"),
-            ("CONCEIÇÃO DAIANE", "SEGURANÇA (ONISYS)", "T1"),
-            ("MATHEUS LUSTOSA", "SEGURANÇA/ELOG", "T1"),
-            ("MANUELA PINHEIRO", "LÍDER", "T2"),
-            ("ISABEL", "LÍDER/SEGURANÇA", "T2"),
-            ("ANDREZA OLIVEIRA", "PICKUP", "T2"),
-            ("ROZIANE DA SILVA", "PICKUP", "T2"),
-            ("DAIANE", "SEGURANÇA", "T2"),
-            ("EMANUEL ROBERTO", "DEPART", "T2"),
-            ("TAMMYRIS DA SILVA", "DROPOFF", "T2"),
-            ("RAPHAEL DO NASCIMENTO", "DROPOFF", "T2"),
-            ("LUDMILLA RODRIGUES", "DROPOFF", "T2"),
-            ("MARIA NATHALIA", "SEGURANÇA", "T2"),
-            ("CINAMOR", "ELOG", "T2"),
-            ("WESLEY", "LÍDER", "T3"),
-            ("JOÃO", "LÍDER/SEGURANÇA", "T3"),
-            ("RILDOMAR", "PICKUP", "T3"),
-            ("LUCIANA", "PICKUP", "T3"),
-            ("GLAYLDSON", "SEGURANÇA", "T3"),
-            ("TAYANARA", "DEPART", "T3"),
-            ("RUAN", "DROPOFF", "T3"),
-            ("BÁRBARA", "DROPOFF", "T3")
-        ]
-
-        cursor.executemany("""
-            INSERT INTO operadores (nome, funcao, turno)
-            VALUES (%s, %s, %s)
-        """, funcionarios_oficiais)
-        conn.commit()
-
-    conn.close()
-
-# Inicializa/valida as estruturas sem usar SQLite.
 criar_banco_do_zero()
 
 # ============================================================
@@ -512,190 +479,193 @@ if "deslocamento_semana" not in st.session_state:
 # ============================================================
 def buscar_operadores():
     conn = conectar()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, nome, funcao, turno
-        FROM operadores
-        WHERE ativo IS TRUE
-        ORDER BY turno, nome
-    """)
-    dados = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return dados
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, nome, funcao, turno
+            FROM operadores
+            WHERE ativo IS TRUE
+            ORDER BY turno, nome
+        """)
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+def buscar_statuses(operador_ids, semana_id):
+    """Busca TODOS os status da semana em uma única consulta."""
+    if not operador_ids:
+        return {}
+
+    conn = conectar()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT operador_id, sexta, sabado, domingo, segunda
+            FROM escala
+            WHERE semana_id = %s
+              AND operador_id = ANY(%s)
+        """, (semana_id, list(operador_ids)))
+
+        return {
+            row[0]: (row[1], row[2], row[3], row[4])
+            for row in cursor.fetchall()
+        }
+    finally:
+        conn.close()
 
 def cadastrar_operador(nome, funcao, turno):
     conn = conectar()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO operadores (nome, funcao, turno)
-        VALUES (%s, %s, %s)
-        """,
-        (nome, funcao, turno)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO operadores (nome, funcao, turno)
+            VALUES (%s, %s, %s)
+            """,
+            (nome, funcao, turno)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def editar_operador(operador_id, nome, funcao, turno):
     conn = conectar()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE operadores
-        SET nome = %s, funcao = %s, turno = %s
-        WHERE id = %s
-        """,
-        (nome, funcao, turno, operador_id)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE operadores
+            SET nome = %s, funcao = %s, turno = %s
+            WHERE id = %s
+            """,
+            (nome, funcao, turno, operador_id)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def remover_operador(operador_id):
     conn = conectar()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE operadores SET ativo = FALSE WHERE id = %s",
-        (operador_id,)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def buscar_status(operador_id, semana_id):
-    conn = conectar()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT sexta, sabado, domingo, segunda
-        FROM escala
-        WHERE operador_id = %s AND semana_id = %s
-        """,
-        (operador_id, semana_id)
-    )
-    resultado = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return resultado
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE operadores SET ativo = FALSE WHERE id = %s",
+            (operador_id,)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def salvar_status(operador_id, semana_id, sexta, sabado, domingo, segunda):
     conn = conectar()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT id
-        FROM escala
-        WHERE operador_id = %s AND semana_id = %s
-        """,
-        (operador_id, semana_id)
-    )
-    existente = cursor.fetchone()
-
-    if existente:
-        cursor.execute(
-            """
-            UPDATE escala
-            SET sexta = %s,
-                sabado = %s,
-                domingo = %s,
-                segunda = %s
-            WHERE operador_id = %s AND semana_id = %s
-            """,
-            (
-                sexta,
-                sabado,
-                domingo,
-                segunda,
-                operador_id,
-                semana_id
-            )
-        )
-    else:
-        cursor.execute(
-            """
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
             INSERT INTO escala (
-                operador_id,
-                semana_id,
-                sexta,
-                sabado,
-                domingo,
-                segunda
+                operador_id, semana_id, sexta, sabado, domingo, segunda
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (operador_id, semana_id)
+            DO UPDATE SET
+                sexta = EXCLUDED.sexta,
+                sabado = EXCLUDED.sabado,
+                domingo = EXCLUDED.domingo,
+                segunda = EXCLUDED.segunda
+        """, (
+            operador_id, semana_id, sexta, sabado, domingo, segunda
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def salvar_statuses_faltantes(operadores, semana_id, status_map):
+    """Inicializa os operadores novos da semana em uma única transação."""
+    faltantes = []
+    for operador_id, nome, funcao, turno in operadores:
+        if operador_id not in status_map:
+            horario = HORARIOS[turno]
+            faltantes.append(
+                (operador_id, semana_id, horario, horario, horario, horario)
+            )
+
+    if not faltantes:
+        return
+
+    conn = conectar()
+    try:
+        cursor = conn.cursor()
+        cursor.executemany("""
+            INSERT INTO escala (
+                operador_id, semana_id, sexta, sabado, domingo, segunda
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (operador_id, semana_id) DO NOTHING
+        """, faltantes)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def registrar_historico(
+    operador_nome, semana_id, dia, de_status, para_status
+):
+    conn = conectar()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO historico (
+                data_hora, operador_nome, semana_id, dia, de_status, para_status
             )
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
             (
-                operador_id,
+                datetime.now().strftime("%d/%m/%Y %H:%M"),
+                operador_nome,
                 semana_id,
-                sexta,
-                sabado,
-                domingo,
-                segunda
+                dia,
+                de_status,
+                para_status
             )
         )
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def registrar_historico(
-    operador_nome,
-    semana_id,
-    dia,
-    de_status,
-    para_status
-):
-    conn = conectar()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO historico (
-            data_hora,
-            operador_nome,
-            semana_id,
-            dia,
-            de_status,
-            para_status
-        )
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-        (
-            datetime.now().strftime("%d/%m/%Y %H:%M"),
-            operador_nome,
-            semana_id,
-            dia,
-            de_status,
-            para_status
-        )
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def buscar_historico(limite=50):
     conn = conectar()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT
-            data_hora,
-            operador_nome,
-            semana_id,
-            dia,
-            de_status,
-            para_status
-        FROM historico
-        ORDER BY id DESC
-        LIMIT %s
-        """,
-        (limite,)
-    )
-    dados = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return dados
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                data_hora, operador_nome, semana_id, dia, de_status, para_status
+            FROM historico
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (limite,)
+        )
+        return cursor.fetchall()
+    finally:
+        conn.close()
 
 # ============================================================
 # DATAS DA ESCALA
@@ -723,13 +693,13 @@ semana_id = semana["id"]
 # ============================================================
 # EXPORTAÇÃO PARA EXCEL (NOVA FUNCIONALIDADE)
 # ============================================================
-def gerar_excel(operadores, semana):
+def gerar_excel(operadores, semana, status_map):
     linhas = []
     for operador_id, nome, funcao, turno in operadores:
-        status = buscar_status(operador_id, semana["id"])
-        if status is None:
-            horario = HORARIOS[turno]
-            status = (horario, horario, horario, horario)
+        status = status_map.get(
+            operador_id,
+            (HORARIOS[turno], HORARIOS[turno], HORARIOS[turno], HORARIOS[turno])
+        )
         linha = {
             "Turno": NOMES_TURNOS[turno],
             "Operador": nome,
@@ -873,8 +843,18 @@ operadores = buscar_operadores()
 if termo_busca:
     operadores = [x for x in operadores if termo_busca.strip().upper() in x[1].upper()]
 
+# Uma única consulta para toda a grade da semana.
+status_map = buscar_statuses([x[0] for x in operadores], semana_id)
+
+# Se houver operador novo nesta semana, cria seus quatro dias em lote.
+salvar_statuses_faltantes(operadores, semana_id, status_map)
+
+# Atualiza o mapa somente se foram inseridos registros faltantes.
+if len(status_map) < len(operadores):
+    status_map = buscar_statuses([x[0] for x in operadores], semana_id)
+
 with col_export:
-    excel_buffer = gerar_excel(operadores, semana)
+    excel_buffer = gerar_excel(operadores, semana, status_map)
     st.download_button(
         label="⬇️",
         data=excel_buffer,
@@ -932,12 +912,10 @@ for turno in ["T1", "T2", "T3"]:
 
         for operador in operadores_turno:
             operador_id, nome, funcao = operador[0], operador[1], operador[2]
-            status = buscar_status(operador_id, semana_id)
-
-            if status is None:
-                horario = HORARIOS[turno]
-                status = (horario, horario, horario, horario)
-                salvar_status(operador_id, semana_id, *status)
+            status = status_map.get(
+                operador_id,
+                (HORARIOS[turno], HORARIOS[turno], HORARIOS[turno], HORARIOS[turno])
+            )
 
             linha = st.columns([2.5, 2, 1.8, 1.8, 1.8, 1.8])
             linha[0].markdown(f"<div class='nome-operador'><b>{nome}</b></div>", unsafe_allow_html=True)
